@@ -7,3 +7,4 @@ lib64/
 # Ignore specific files
 pyvenv.cfg
 .env
+lib64
