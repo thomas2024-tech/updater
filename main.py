@@ -6,8 +6,11 @@ import threading
 import signal
 import sys
 import requests
+from commlib.node import Node
 from commlib.transports.redis import ConnectionParameters, Subscriber
 from commlib.pubsub import PubSubMessage
+from commlib.rpc import RPCClient, RPCMessage
+from packaging.version import parse as parse_version
 
 # Configure logging to write to the console
 logging.basicConfig(
@@ -17,79 +20,101 @@ logging.basicConfig(
 )
 
 def flush_logs():
-    """Flush the console handler"""
+    """Flush the console handler."""
     for handler in logging.getLogger().handlers:
         handler.flush()
 
+# Update the VersionMessage class to include dependencies
 class VersionMessage(PubSubMessage):
     """Message format for version updates."""
     appname: str
     version_number: str
+    dependencies: dict  # New field to store dependent apps and their versions
 
-class DockerComposeManager:
-    def __init__(self, search_directory):
-        self.search_directory = search_directory
-        self.processed_directories = set()
+# Define RPC message classes
+class DockerCommandRequest(RPCMessage):
+    """RPC message for docker command requests."""
+    command: str  # e.g., 'down', 'update_version'
+    directory: str
+    new_version: str = None  # Optional, needed for 'update_version' command
 
-    def find_docker_compose_files(self):
-        """Finds all docker-compose.yml files in the search directory and its subdirectories."""
-        compose_files = []
-        for root, dirs, files in os.walk(self.search_directory):
-            if 'docker-compose.yml' in files:
-                compose_files.append(root)
-        return compose_files
+class DockerCommandResponse(RPCMessage):
+    """RPC response for docker command execution."""
+    success: bool
+    message: str
 
-    def run_docker_compose(self, directory):
-        """Runs 'docker compose up -d' in the specified directory."""
-        logging.info(f"Running 'docker compose up -d' in {directory}")
-        flush_logs()
+class RPCDockerManager:
+    def __init__(self):
+        redis_host = os.getenv('REDIS_HOST', 'localhost')
+        redis_port = int(os.getenv('REDIS_PORT', 6379))
+        redis_db = int(os.getenv('REDIS_DB', 0))
+        self.conn_params = ConnectionParameters(
+            host=redis_host,
+            port=redis_port,
+            db=redis_db
+        )
+        # Initialize the Node
+        self.node = Node(node_name='updater_node', connection_params=self.conn_params)
+        # Start the node's event loop in a separate thread
+        self.node.run_threaded()
+
+        # Map app names to RPC clients
+        self.app_to_rpc_client = {
+            'app1': RPCClient(
+                node=self.node,
+                rpc_name='docker_compose_service_machine1',
+                msg_type=DockerCommandRequest,
+                resp_type=DockerCommandResponse
+            ),
+            'app2': RPCClient(
+                node=self.node,
+                rpc_name='docker_compose_service_machine2',
+                msg_type=DockerCommandRequest,
+                resp_type=DockerCommandResponse
+            ),
+            'app3': RPCClient(
+                node=self.node,
+                rpc_name='docker_compose_service_machine3',
+                msg_type=DockerCommandRequest,
+                resp_type=DockerCommandResponse
+            ),
+        }
+
+    def update_app_version(self, appname, directory, new_version):
+        rpc_client = self.app_to_rpc_client.get(appname)
+        if not rpc_client:
+            logging.error(f"No RPC client found for app '{appname}'")
+            return
+
+        request = DockerCommandRequest(
+            command='update_version',
+            directory=directory,
+            new_version=new_version
+        )
         try:
-            result = os.system(f"docker compose -f {directory}/docker-compose.yml up -d")
-            if result == 0:
-                logging.info(f"'docker compose up -d' succeeded in {directory}")
+            response = rpc_client.call(request)
+            if response.success:
+                logging.info(f"Successfully updated {appname} to version {new_version}")
             else:
-                logging.error(f"Error running 'docker compose up -d' in {directory}")
+                logging.error(f"Failed to update {appname}: {response.message}")
         except Exception as e:
-            logging.error(f"Exception occurred while running 'docker compose up -d' in {directory}: {e}")
-        flush_logs()
+            logging.error(f"Exception while updating {appname}: {e}")
 
 class DockerHubManager:
-    def __init__(self, config):
-        self.username = config.get('DOCKER_HUB_USERNAME')
-        self.password = config.get('DOCKER_HUB_PASSWORD')
-        self.token = None
-        if not self.username or not self.password:
-            logging.error("Docker Hub credentials are not set in 'config.json'.")
+    def __init__(self):
+        self.username = os.getenv('DOCKER_HUB_USERNAME')
+        self.token = os.getenv('DOCKER_HUB_TOKEN')
+        if not self.username or not self.token:
+            logging.error("Docker Hub credentials are not set in environment variables.")
             sys.exit(1)
-        self.obtain_token()
         self.image_versions = self.list_docker_images()
-
-    def obtain_token(self):
-        """Obtains a JWT token from Docker Hub using username and password."""
-        url = "https://hub.docker.com/v2/users/login/"
-        payload = {"username": self.username, "password": self.password}
-        try:
-            response = requests.post(url, json=payload)
-            if response.status_code == 200:
-                self.token = response.json().get('token')
-                if self.token:
-                    logging.info("Successfully obtained Docker Hub token.")
-                else:
-                    logging.error("Token not found in response.")
-                    sys.exit(1)
-            else:
-                logging.error(f"Failed to get token: {response.status_code} - {response.text}")
-                sys.exit(1)
-        except Exception as e:
-            logging.error(f"Exception during token retrieval: {e}")
-            sys.exit(1)
 
     def list_docker_images(self):
         """Lists Docker images and their tags in the Docker Hub account."""
         image_versions = {}
         try:
             base_url = f"https://hub.docker.com/v2/repositories/{self.username}/?page_size=100"
-            headers = {'Authorization': f'JWT {self.token}'}
+            headers = {'Authorization': f'Bearer {self.token}'}
             logging.info(f"Listing images and tags for Docker Hub account '{self.username}':")
 
             url = base_url
@@ -135,8 +160,9 @@ class DockerHubManager:
         return image_versions
 
 class VersionListener:
-    def __init__(self, docker_hub_manager):
+    def __init__(self, docker_hub_manager, rpc_manager):
         self.docker_hub_manager = docker_hub_manager
+        self.rpc_manager = rpc_manager
         redis_host = os.getenv('REDIS_HOST', 'localhost')
         redis_port = int(os.getenv('REDIS_PORT', 6379))
         redis_db = int(os.getenv('REDIS_DB', 0))
@@ -154,16 +180,46 @@ class VersionListener:
             on_message=self.on_message_received
         )
 
+        self.current_versions = {}  # Store current versions of apps
+
+        # Read app-to-directory mapping from environment variable
+        app_to_directory_str = os.getenv('APP_TO_DIRECTORY')
+        if app_to_directory_str:
+            try:
+                self.app_to_directory = json.loads(app_to_directory_str)
+            except json.JSONDecodeError as e:
+                logging.error(f"Error parsing APP_TO_DIRECTORY environment variable: {e}")
+                sys.exit(1)
+        else:
+            logging.error("APP_TO_DIRECTORY environment variable is not set.")
+            sys.exit(1)
+
+        self._stop_event = threading.Event()
+
     def on_message_received(self, msg: VersionMessage):
         logging.info(f"Received message: App '{msg.appname}' is running version '{msg.version_number}'")
+        # Update current versions
+        self.current_versions[msg.appname] = msg.version_number
         self.process_version_message(msg)
         flush_logs()
+
+    def version_compare(self, v1, v2):
+        """Compare version strings."""
+        v1_parsed = parse_version(v1)
+        v2_parsed = parse_version(v2)
+        if v1_parsed > v2_parsed:
+            return 1
+        elif v1_parsed == v2_parsed:
+            return 0
+        else:
+            return -1
 
     def process_version_message(self, msg):
         """Processes the received version message."""
         try:
             appname = msg.appname
             version_number = msg.version_number
+            dependencies = msg.dependencies  # Get dependencies
 
             # Check if the app exists in Docker Hub
             if appname in self.docker_hub_manager.image_versions:
@@ -176,34 +232,48 @@ class VersionListener:
             else:
                 logging.error(f"App '{appname}' not found in Docker Hub repositories.")
 
+            # Now check the dependencies
+            for dep_appname, dep_version_required in dependencies.items():
+                dep_version_running = self.current_versions.get(dep_appname)
+                if dep_version_running is None:
+                    logging.warning(f"No version information for dependency '{dep_appname}'")
+                    continue
+
+                compare_result = self.version_compare(dep_version_running, dep_version_required)
+                if compare_result >= 0:
+                    logging.info(f"Dependency '{dep_appname}' is at version '{dep_version_running}', which satisfies the required version '{dep_version_required}'.")
+                else:
+                    logging.warning(f"Dependency '{dep_appname}' is at version '{dep_version_running}', which does not satisfy the required version '{dep_version_required}'.")
+                    # Send RPC command to update the dependency
+                    directory = self.app_to_directory.get(dep_appname)
+                    if directory:
+                        logging.info(f"Sending update command to app '{dep_appname}' to update to version '{dep_version_required}'")
+                        self.rpc_manager.update_app_version(dep_appname, directory, dep_version_required)
+                    else:
+                        logging.error(f"No directory information for app '{dep_appname}'")
         except Exception as e:
             logging.error(f"Error processing message: {e}")
         flush_logs()
 
     def listen(self):
         """Starts the subscriber to listen to the version channel."""
-        self.subscriber.run()
+        try:
+            self.subscriber.run()
+            while not self._stop_event.is_set():
+                time.sleep(0.1)
+        except Exception as e:
+            logging.error(f"Exception in listener thread: {e}")
+
+    def stop(self):
+        """Stops the listener."""
+        self._stop_event.set()
+        self.subscriber.stop()
 
 class MainApplication:
     def __init__(self):
-        self.search_directory = '/data/firmwares'
-        self.docker_manager = DockerComposeManager(self.search_directory)
-        self.config = self.load_config()
-        self.docker_hub_manager = DockerHubManager(self.config)
-        self.version_listener = VersionListener(self.docker_hub_manager)
-
-    def load_config(self):
-        """Loads configuration from config.json."""
-        try:
-            with open('config.json', 'r') as config_file:
-                config = json.load(config_file)
-            return config
-        except FileNotFoundError:
-            logging.error("Configuration file 'config.json' not found.")
-            sys.exit(1)
-        except json.JSONDecodeError as e:
-            logging.error(f"Error parsing 'config.json': {e}")
-            sys.exit(1)
+        self.docker_hub_manager = DockerHubManager()
+        self.rpc_manager = RPCDockerManager()
+        self.version_listener = VersionListener(self.docker_hub_manager, self.rpc_manager)
 
     def setup_signal_handlers(self):
         """Set up signal handlers for graceful shutdown."""
@@ -213,38 +283,30 @@ class MainApplication:
     def signal_handler(self, sig, frame):
         """Handles shutdown signals."""
         logging.info('Shutdown signal received. Exiting...')
+        self.version_listener.stop()
         flush_logs()
         sys.exit(0)
 
     def run(self):
-        """Main function to check for docker-compose files and handle version updates."""
+        """Main function to handle version updates and RPC functionality."""
         # Start the listener in a separate thread
         listener_thread = threading.Thread(target=self.version_listener.listen, daemon=True)
         listener_thread.start()
 
-        # Check for docker-compose.yml files only once
-        logging.info(f"Checking for docker-compose.yml files in {self.search_directory}")
-        compose_dirs = self.docker_manager.find_docker_compose_files()
-        count = len(compose_dirs)
-
-        if count == 0:
-            logging.info("There are no docker-compose.yml files in the folder specified!")
-        else:
-            logging.info(f"Found {count} docker-compose.yml files.")
-
-            # Run 'docker compose up -d' in each directory
-            for dir in compose_dirs:
-                if dir not in self.docker_manager.processed_directories:
-                    self.docker_manager.run_docker_compose(dir)
-                    self.docker_manager.processed_directories.add(dir)
-
         flush_logs()
 
-        # Keep the container running
-        while True:
-            logging.info("Task completed. Sleeping for 1 hour.")
-            flush_logs()
-            time.sleep(3600)
+        # Keep the application running
+        try:
+            while True:
+                time.sleep(1)
+                if not listener_thread.is_alive():
+                    logging.error("Listener thread has stopped unexpectedly. Exiting...")
+                    break
+        except KeyboardInterrupt:
+            logging.info("KeyboardInterrupt received. Exiting...")
+        finally:
+            self.version_listener.stop()
+            listener_thread.join()
 
 if __name__ == "__main__":
     app = MainApplication()
