@@ -56,7 +56,7 @@ This system automates the management of Dockerized applications by monitoring ve
 
 - Exposes an RPC service on application host machines to handle Docker Compose commands.
 
-  **Functionality**:
+**Functionality**:
 
 - Handles down and update_version commands.
 - Updates the docker-compose.yml file with new image versions.
