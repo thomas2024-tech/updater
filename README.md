@@ -11,16 +11,12 @@ This repository has a Python script designed to manage Docker services using Red
   - Docker Compose RPC Service
 - Setup Instructions
   - Prerequisites
-  - Installation
-  - Configuration
+- Installation
+- Configuration
 - Usage
-- Environment Variables
-- Logging
-- Error Handling
-- Testing
-- Troubleshooting
-- Contributing
-- License
+ - Running the Main Application
+ - Running the Docker Compose RPC Service
+
 
 ## Introduction
 
@@ -82,4 +78,12 @@ This system automates the management of Dockerized applications by monitoring ve
 - Access to Docker Hub
 - Access to Github
 
-    
+## Installation
+
+## Configuration
+
+## Usage
+
+### Running the Main Application
+
+### Running the Docker Compose RPC Service
