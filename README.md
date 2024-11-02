@@ -79,7 +79,7 @@ This system automates the management of Dockerized applications by monitoring ve
 - Access to Github
 
 ## Installation
-Both the updater and the firmwares are dockerized (via the respective Dockerfiles). Also examples of docker-compose.yml are also provided
+Both the updater and the firmwares are dockerized (via the respective Dockerfiles). Also examples of docker-compose.yml are also provided. Also the updater app (dockerized) is supposed to start as a system service (the respective .sh file is also provided).
 
 ## Configuration
 
