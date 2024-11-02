@@ -13,7 +13,7 @@ services:
     container_name: python-main-script
     depends_on:
       - redis
-    command: python -u main.py
+    command: python -u updater.py
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
