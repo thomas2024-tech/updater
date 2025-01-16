@@ -370,6 +370,9 @@ class MainApplication:
         # Initialize the VersionListener to listen for version updates
         self.version_listener = VersionListener(self.docker_hub_manager, self.rpc_manager)
 
+        # A flag to signal the background thread to stop
+        self._stop_event = threading.Event()
+
     def setup_signal_handlers(self):
         """
         Sets up signal handlers to gracefully handle shutdown signals like SIGINT and SIGTERM.
@@ -386,16 +389,82 @@ class MainApplication:
         """
         logging.info('Shutdown signal received. Exiting...')
         self.version_listener.stop()
+        # Signal our background thread to stop
+        self._stop_event.set()
         flush_logs()
         sys.exit(0)
+
+    def check_for_new_versions(self):
+        """
+        Checks Docker Hub for any newer versions of the configured apps every hour.
+        If it finds a newer version, it asks the user whether to update.
+        """
+        # Retrieve the dictionary: { appname: [list_of_tags], ... }
+        all_image_versions = self.docker_hub_manager.image_versions
+
+        for app_name, available_tags in all_image_versions.items():
+            # Get the currently running version (if known via messages).
+            current_version = self.version_listener.current_versions.get(app_name)
+            if not current_version:
+                logging.info(f"No known running version for app '{app_name}'. Skipping.")
+                continue
+
+            # Sort the tags so we can pick the highest version
+            # (Filtering out any non-semver tags if necessary)
+            sorted_tags = sorted(
+                (tag for tag in available_tags),
+                key=lambda t: parse_version(t),
+            )
+
+            if not sorted_tags:
+                logging.info(f"No tags found on Docker Hub for '{app_name}'.")
+                continue
+
+            latest_version = sorted_tags[-1]  # Last item in the sorted list is the highest
+            if parse_version(latest_version) > parse_version(current_version):
+                # Found a newer version
+                print(f"\n[INFO] A newer version '{latest_version}' is available for '{app_name}'.")
+                choice = input("Do you want to update? (y/n): ").strip().lower()
+
+                if choice == 'y':
+                    # Determine the directory for the app
+                    directory = self.version_listener.app_to_directory.get(app_name)
+                    if directory:
+                        logging.info(f"Updating '{app_name}' to version '{latest_version}'...")
+                        self.rpc_manager.update_app_version(app_name, directory, latest_version)
+                    else:
+                        logging.error(f"No directory mapping found for '{app_name}'. Cannot update.")
+                else:
+                    logging.info(f"Skipping update for '{app_name}'.")
+            else:
+                logging.info(f"'{app_name}' is up-to-date (version {current_version}).")
+
+        flush_logs()
 
     def run(self):
         """
         Starts the version listener in a separate thread and keeps the application running.
+        Also starts another thread to periodically check Docker Hub for newer versions.
         """
         # Start the listener thread
         listener_thread = threading.Thread(target=self.version_listener.listen, daemon=True)
         listener_thread.start()
+
+        def hourly_check():
+            """
+            Runs in a loop, checking for new versions every hour.
+            """
+            while not self._stop_event.is_set():
+                # Perform the check
+                self.check_for_new_versions()
+                # Sleep for 1 hour (3600 seconds)
+                for _ in range(3600):
+                    if self._stop_event.is_set():
+                        break
+                    time.sleep(1)
+
+        checker_thread = threading.Thread(target=hourly_check, daemon=True)
+        checker_thread.start()
 
         flush_logs()
 
@@ -412,7 +481,9 @@ class MainApplication:
         finally:
             # Ensure the listener is stopped and the thread is joined before exiting
             self.version_listener.stop()
+            self._stop_event.set()  # Signal the checker thread to stop
             listener_thread.join()
+            checker_thread.join()
 
 if __name__ == "__main__":
     # Entry point of the application
