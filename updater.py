@@ -9,8 +9,16 @@ import requests
 from commlib.node import Node
 from commlib.transports.redis import ConnectionParameters, Subscriber
 from commlib.pubsub import PubSubMessage
-from commlib.rpc import RPCClient, RPCMessage
+#from commlib.rpc import RPCClient, RPCMessage
+from commlib.rpc import BaseRPCClient
+from commlib.rpc import RPCMessage
 from packaging.version import parse as parse_version
+from dotenv import load_dotenv
+import threading
+
+# Load environment variables from .env file
+load_dotenv()
+
 
 # Configure logging to write to the console with a specific format
 logging.basicConfig(
@@ -64,73 +72,62 @@ class DockerCommandResponse(RPCMessage):
     message: str
 
 class RPCDockerManager:
-    """
-    Manages RPC clients for sending Docker commands to different applications.
-    Initializes RPC clients for each application and provides methods to update app versions.
-    """
     def __init__(self):
-        # Retrieve Redis connection parameters from environment variables or use defaults
         redis_host = os.getenv('REDIS_HOST', 'localhost')
         redis_port = int(os.getenv('REDIS_PORT', 6379))
         redis_db = int(os.getenv('REDIS_DB', 0))
 
-        # Set up connection parameters for Redis
+        # Create connection parameters
         self.conn_params = ConnectionParameters(
             host=redis_host,
             port=redis_port,
             db=redis_db
         )
 
-        # Initialize a Node for RPC communication
-        self.node = Node(node_name='updater_node', connection_params=self.conn_params)
+        # Create a Node
+        self.node = Node(
+            node_name='updater_node',
+            connection_params=self.conn_params
+        )
+        
+        # Start the Node in a separate thread
+        threading.Thread(target=self.node.run, daemon=True).start()
 
-        # Start the node's event loop in a separate thread to handle asynchronous communication
-        self.node.run_threaded()
-
-        # Map application names to their respective RPC clients
-        self.app_to_rpc_client = {
-            'app1': RPCClient(
-                node=self.node,
-                rpc_name='docker_compose_service_machine1',
-                msg_type=DockerCommandRequest,
-                resp_type=DockerCommandResponse
-            ),
-            'app2': RPCClient(
-                node=self.node,
-                rpc_name='docker_compose_service_machine2',
-                msg_type=DockerCommandRequest,
-                resp_type=DockerCommandResponse
-            ),
-            'app3': RPCClient(
-                node=self.node,
-                rpc_name='docker_compose_service_machine3',
-                msg_type=DockerCommandRequest,
-                resp_type=DockerCommandResponse
-            ),
+        # Map application names to their RPC clients
+        self.app_to_rpc_client = {}
+        
+        # Create RPC clients using Node's create_rpc_client method
+        service_mapping = {
+            'app1': 'docker_compose_service_machine1',
+            'app2': 'docker_compose_service_machine2',
+            'app3': 'docker_compose_service_machine3'
         }
 
+        for app, service in service_mapping.items():
+            # Create RPC client with minimal parameters
+            client = self.node.create_rpc_client(
+                service  # Just pass the service name
+            )
+            if client:
+                # Configure the message types after creation
+                client.msg_class = DockerCommandRequest
+                client.resp_class = DockerCommandResponse
+                self.app_to_rpc_client[app] = client
+            else:
+                logging.error(f"Failed to create RPC client for service {service}")
+
     def update_app_version(self, appname, directory, new_version):
-        """
-        Sends an RPC command to update the application's version.
-        Args:
-            appname (str): Name of the application to update.
-            directory (str): Directory where the Docker command should be executed.
-            new_version (str): The new version to update the application to.
-        """
-        # Retrieve the RPC client for the specified application
         rpc_client = self.app_to_rpc_client.get(appname)
         if not rpc_client:
             logging.error(f"No RPC client found for app '{appname}'")
             return
 
-        # Create a request message with the command details
         request = DockerCommandRequest(
             command='update_version',
             directory=directory,
             new_version=new_version
         )
         try:
-            # Send the RPC request and wait for the response
             response = rpc_client.call(request)
             if response.success:
                 logging.info(f"Successfully updated {appname} to version {new_version}")
