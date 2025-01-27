@@ -77,26 +77,19 @@ class RPCDockerManager:
         redis_port = int(os.getenv('REDIS_PORT', 6379))
         redis_db = int(os.getenv('REDIS_DB', 0))
 
-        # Create connection parameters
         self.conn_params = ConnectionParameters(
             host=redis_host,
             port=redis_port,
             db=redis_db
         )
 
-        # Create a Node
         self.node = Node(
             node_name='updater_node',
             connection_params=self.conn_params
         )
         
-        # Start the Node in a separate thread
-        threading.Thread(target=self.node.run, daemon=True).start()
-
-        # Map application names to their RPC clients
         self.app_to_rpc_client = {}
         
-        # Create RPC clients using Node's create_rpc_client method
         service_mapping = {
             'app1': 'docker_compose_service_machine1',
             'app2': 'docker_compose_service_machine2',
@@ -104,14 +97,8 @@ class RPCDockerManager:
         }
 
         for app, service in service_mapping.items():
-            # Create RPC client with minimal parameters
-            client = self.node.create_rpc_client(
-                service  # Just pass the service name
-            )
+            client = self.node.create_rpc_client(service)
             if client:
-                # Configure the message types after creation
-                client.msg_class = DockerCommandRequest
-                client.resp_class = DockerCommandResponse
                 self.app_to_rpc_client[app] = client
             else:
                 logging.error(f"Failed to create RPC client for service {service}")
@@ -122,19 +109,30 @@ class RPCDockerManager:
             logging.error(f"No RPC client found for app '{appname}'")
             return
 
-        request = DockerCommandRequest(
-            command='update_version',
-            directory=directory,
-            new_version=new_version
-        )
         try:
-            response = rpc_client.call(request)
-            if response.success:
+            # Send both host and container paths
+            request = {
+                'command': 'update_version',
+                'directory': directory,
+                'docker_compose_path': 'docker-compose.yml',
+                'new_version': new_version
+            }
+
+            response = rpc_client.call(request, timeout=60)  # Increase timeout to 60 seconds
+            
+            if not response:
+                raise Exception("No response received from RPC call")
+                
+            if response.get('success'):
                 logging.info(f"Successfully updated {appname} to version {new_version}")
             else:
-                logging.error(f"Failed to update {appname}: {response.message}")
+                error_msg = response.get('message', 'Unknown error')
+                logging.error(f"Failed to update {appname}: {error_msg}")
+                raise Exception(error_msg)
+                
         except Exception as e:
             logging.error(f"Exception while updating {appname}: {e}")
+            raise
 
 class DockerHubManager:
     """
@@ -455,7 +453,7 @@ class MainApplication:
                 # Perform the check
                 self.check_for_new_versions()
                 # Sleep for 1 hour (3600 seconds)
-                for _ in range(3600):
+                for _ in range(60):
                     if self._stop_event.is_set():
                         break
                     time.sleep(1)
