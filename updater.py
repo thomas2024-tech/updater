@@ -118,7 +118,7 @@ class RPCDockerManager:
                 'new_version': new_version
             }
 
-            response = rpc_client.call(request, timeout=60)  # Increase timeout to 60 seconds
+            response = rpc_client.call(request, timeout=60)
             
             if not response:
                 raise Exception("No response received from RPC call")
@@ -341,7 +341,7 @@ class VersionListener:
         try:
             self.subscriber.run()
             while not self._stop_event.is_set():
-                time.sleep(0.1)  # Sleep briefly to avoid busy waiting
+                time.sleep(0.1)
         except Exception as e:
             logging.error(f"Exception in listener thread: {e}")
 
@@ -452,8 +452,8 @@ class MainApplication:
             while not self._stop_event.is_set():
                 # Perform the check
                 self.check_for_new_versions()
-                # Sleep for 1 hour (3600 seconds)
-                for _ in range(60):
+                # Sleep for 2 minutes (120 seconds)
+                for _ in range(120):
                     if self._stop_event.is_set():
                         break
                     time.sleep(1)
