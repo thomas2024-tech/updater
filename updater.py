@@ -9,7 +9,6 @@ import requests
 from commlib.node import Node
 from commlib.transports.redis import ConnectionParameters, Subscriber
 from commlib.pubsub import PubSubMessage
-#from commlib.rpc import RPCClient, RPCMessage
 from commlib.rpc import BaseRPCClient
 from commlib.rpc import RPCMessage
 from packaging.version import parse as parse_version
@@ -46,7 +45,7 @@ class VersionMessage(PubSubMessage):
     """
     appname: str
     version_number: str
-    dependencies: dict  # To store dependent apps and their versions
+    dependencies: dict
 
 # Define RPC message classes for Docker commands
 class DockerCommandRequest(RPCMessage):
