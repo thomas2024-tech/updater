@@ -7,18 +7,26 @@ services:
     volumes:
       - ./redis.conf:/usr/local/etc/redis/redis.conf
     command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    networks:
+      - updater-network
 
-#  python-app:
-#    build: .
-#    container_name: python-main-script
-#    depends_on:
-#      - redis
-#    command: python -u updater.py
-#    environment:
-#      - REDIS_HOST=redis
-#      - REDIS_PORT=6379
-#      - REDIS_DB=0
-#      - DOCKER_HUB_USERNAME=${DOCKER_HUB_USERNAME}
-#      - DOCKER_HUB_TOKEN=${DOCKER_HUB_TOKEN}      
-#    stdin_open: true 
-#    tty: true
+  updater:
+    build: .
+    container_name: updater-service
+    depends_on:
+      - redis
+    environment:
+      - REDIS_HOST=${REDIS_HOST:-redis}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - REDIS_DB=${REDIS_DB:-0}
+      - DOCKER_HUB_USERNAME=${DOCKER_HUB_USERNAME}
+      - DOCKER_HUB_TOKEN=${DOCKER_HUB_TOKEN}
+      - APP_TO_DIRECTORY=${APP_TO_DIRECTORY}
+      - APPS_TO_UPDATE=${APPS_TO_UPDATE}
+    restart: unless-stopped
+    networks:
+      - updater-network
+
+networks:
+  updater-network:
+    driver: bridge

@@ -9,6 +9,7 @@ import requests
 from commlib.node import Node
 from commlib.transports.redis import ConnectionParameters, Subscriber
 from commlib.pubsub import PubSubMessage
+#from commlib.rpc import RPCClient, RPCMessage
 from commlib.rpc import BaseRPCClient
 from commlib.rpc import RPCMessage
 from packaging.version import parse as parse_version
@@ -45,7 +46,7 @@ class VersionMessage(PubSubMessage):
     """
     appname: str
     version_number: str
-    dependencies: dict
+    dependencies: dict  # To store dependent apps and their versions
 
 # Define RPC message classes for Docker commands
 class DockerCommandRequest(RPCMessage):
@@ -76,19 +77,26 @@ class RPCDockerManager:
         redis_port = int(os.getenv('REDIS_PORT', 6379))
         redis_db = int(os.getenv('REDIS_DB', 0))
 
+        # Create connection parameters
         self.conn_params = ConnectionParameters(
             host=redis_host,
             port=redis_port,
             db=redis_db
         )
 
+        # Create a Node
         self.node = Node(
             node_name='updater_node',
             connection_params=self.conn_params
         )
         
+        # Start the Node in a separate thread
+        threading.Thread(target=self.node.run, daemon=True).start()
+
+        # Map application names to their RPC clients
         self.app_to_rpc_client = {}
         
+        # Create RPC clients using Node's create_rpc_client method
         service_mapping = {
             'app1': 'docker_compose_service_machine1',
             'app2': 'docker_compose_service_machine2',
@@ -96,8 +104,14 @@ class RPCDockerManager:
         }
 
         for app, service in service_mapping.items():
-            client = self.node.create_rpc_client(service)
+            # Create RPC client with minimal parameters
+            client = self.node.create_rpc_client(
+                service  # Just pass the service name
+            )
             if client:
+                # Configure the message types after creation
+                client.msg_class = DockerCommandRequest
+                client.resp_class = DockerCommandResponse
                 self.app_to_rpc_client[app] = client
             else:
                 logging.error(f"Failed to create RPC client for service {service}")
@@ -108,30 +122,19 @@ class RPCDockerManager:
             logging.error(f"No RPC client found for app '{appname}'")
             return
 
+        request = DockerCommandRequest(
+            command='update_version',
+            directory=directory,
+            new_version=new_version
+        )
         try:
-            # Send both host and container paths
-            request = {
-                'command': 'update_version',
-                'directory': directory,
-                'docker_compose_path': 'docker-compose.yml',
-                'new_version': new_version
-            }
-
-            response = rpc_client.call(request, timeout=60)
-            
-            if not response:
-                raise Exception("No response received from RPC call")
-                
-            if response.get('success'):
+            response = rpc_client.call(request)
+            if response.success:
                 logging.info(f"Successfully updated {appname} to version {new_version}")
             else:
-                error_msg = response.get('message', 'Unknown error')
-                logging.error(f"Failed to update {appname}: {error_msg}")
-                raise Exception(error_msg)
-                
+                logging.error(f"Failed to update {appname}: {response.message}")
         except Exception as e:
             logging.error(f"Exception while updating {appname}: {e}")
-            raise
 
 class DockerHubManager:
     """
@@ -252,6 +255,20 @@ class VersionListener:
             logging.error("APP_TO_DIRECTORY environment variable is not set.")
             sys.exit(1)
 
+        # Read apps to update from environment variable
+        apps_to_update_str = os.getenv('APPS_TO_UPDATE')
+        if apps_to_update_str:
+            try:
+                # Parse the JSON string into a dictionary
+                self.apps_to_update = json.loads(apps_to_update_str)
+                logging.info(f"Apps to update loaded: {self.apps_to_update}")
+            except json.JSONDecodeError as e:
+                logging.error(f"Error parsing APPS_TO_UPDATE environment variable: {e}")
+                sys.exit(1)
+        else:
+            logging.warning("APPS_TO_UPDATE environment variable is not set. No specific apps will be updated.")
+            self.apps_to_update = {}
+
         self._stop_event = threading.Event()  # Event to signal the listener to stop
 
     def on_message_received(self, msg: VersionMessage):
@@ -307,27 +324,35 @@ class VersionListener:
             else:
                 logging.error(f"App '{appname}' not found in Docker Hub repositories.")
 
-            # Check dependencies to see if they need updates
-            for dep_appname, dep_version_required in dependencies.items():
-                # Get the current version of the dependency
-                dep_version_running = self.current_versions.get(dep_appname)
-                if dep_version_running is None:
-                    logging.warning(f"No version information for dependency '{dep_appname}'")
-                    continue
-
-                # Compare the running version with the required version
-                compare_result = self.version_compare(dep_version_running, dep_version_required)
-                if compare_result >= 0:
-                    logging.info(f"Dependency '{dep_appname}' is at version '{dep_version_running}', which satisfies the required version '{dep_version_required}'.")
-                else:
-                    logging.warning(f"Dependency '{dep_appname}' is at version '{dep_version_running}', which does not satisfy the required version '{dep_version_required}'.")
-                    # Send an RPC command to update the dependency
-                    directory = self.app_to_directory.get(dep_appname)
-                    if directory:
-                        logging.info(f"Sending update command to app '{dep_appname}' to update to version '{dep_version_required}'")
-                        self.rpc_manager.update_app_version(dep_appname, directory, dep_version_required)
+            # Check if this app is in the list of apps to update
+            if appname in self.apps_to_update:
+                target_version = self.apps_to_update[appname]
+                if version_number != target_version:
+                    logging.info(f"🔄 App '{appname}' is running version '{version_number}', but requested version is '{target_version}'.")
+                    
+                    # Check if target version exists on Docker Hub
+                    if appname in self.docker_hub_manager.image_versions:
+                        available_versions = self.docker_hub_manager.image_versions[appname]
+                        if target_version in available_versions:
+                            directory = self.app_to_directory.get(appname)
+                            if directory:
+                                logging.info(f"✅ Updating '{appname}' to requested version '{target_version}'...")
+                                self.rpc_manager.update_app_version(appname, directory, target_version)
+                            else:
+                                logging.error(f"❌ No directory mapping found for '{appname}'. Cannot update.")
+                        else:
+                            logging.error(f"❌ Requested version '{target_version}' for app '{appname}' not found on Docker Hub.")
+                            logging.info(f"📋 Available versions for '{appname}': {', '.join(available_versions[:10])}{'...' if len(available_versions) > 10 else ''}")
                     else:
-                        logging.error(f"No directory information for app '{dep_appname}'")
+                        logging.error(f"❌ App '{appname}' not found in Docker Hub repositories.")
+                else:
+                    logging.info(f"✅ App '{appname}' is already running the requested version '{target_version}'.")
+            else:
+                logging.info(f"ℹ️  App '{appname}' is not in the update list. Current version: '{version_number}'")
+
+            # Dependencies are ignored - all updates controlled by APPS_TO_UPDATE configuration
+            if dependencies:
+                logging.info(f"📋 App '{appname}' reported dependencies: {dependencies} (ignored - using APPS_TO_UPDATE instead)")
         except Exception as e:
             logging.error(f"Error processing message: {e}")
         flush_logs()
@@ -340,7 +365,7 @@ class VersionListener:
         try:
             self.subscriber.run()
             while not self._stop_event.is_set():
-                time.sleep(0.1)
+                time.sleep(0.1)  # Sleep briefly to avoid busy waiting
         except Exception as e:
             logging.error(f"Exception in listener thread: {e}")
 
@@ -366,6 +391,9 @@ class MainApplication:
 
         # A flag to signal the background thread to stop
         self._stop_event = threading.Event()
+        
+        # Validate apps to update on startup
+        self.validate_apps_to_update()
 
     def setup_signal_handlers(self):
         """
@@ -388,77 +416,58 @@ class MainApplication:
         flush_logs()
         sys.exit(0)
 
-    def check_for_new_versions(self):
+    def validate_apps_to_update(self):
         """
-        Checks Docker Hub for any newer versions of the configured apps every hour.
-        If it finds a newer version, it asks the user whether to update.
+        Validates that all requested app versions exist on Docker Hub.
+        Logs warnings for any non-existent versions.
         """
-        # Retrieve the dictionary: { appname: [list_of_tags], ... }
-        all_image_versions = self.docker_hub_manager.image_versions
+        if not self.version_listener.apps_to_update:
+            logging.info("📋 No specific apps to update. Updater will only monitor and log app versions.")
+            return
 
-        for app_name, available_tags in all_image_versions.items():
-            # Get the currently running version (if known via messages).
-            current_version = self.version_listener.current_versions.get(app_name)
-            if not current_version:
-                logging.info(f"No known running version for app '{app_name}'. Skipping.")
-                continue
-
-            # Sort the tags so we can pick the highest version
-            # (Filtering out any non-semver tags if necessary)
-            sorted_tags = sorted(
-                (tag for tag in available_tags),
-                key=lambda t: parse_version(t),
-            )
-
-            if not sorted_tags:
-                logging.info(f"No tags found on Docker Hub for '{app_name}'.")
-                continue
-
-            latest_version = sorted_tags[-1]  # Last item in the sorted list is the highest
-            if parse_version(latest_version) > parse_version(current_version):
-                # Found a newer version
-                print(f"\n[INFO] A newer version '{latest_version}' is available for '{app_name}'.")
-                choice = input("Do you want to update? (y/n): ").strip().lower()
-
-                if choice == 'y':
-                    # Determine the directory for the app
-                    directory = self.version_listener.app_to_directory.get(app_name)
-                    if directory:
-                        logging.info(f"Updating '{app_name}' to version '{latest_version}'...")
-                        self.rpc_manager.update_app_version(app_name, directory, latest_version)
-                    else:
-                        logging.error(f"No directory mapping found for '{app_name}'. Cannot update.")
+        logging.info("🔍 Validating requested app versions against Docker Hub...")
+        all_valid = True
+        
+        for app_name, target_version in self.version_listener.apps_to_update.items():
+            if app_name in self.docker_hub_manager.image_versions:
+                available_versions = self.docker_hub_manager.image_versions[app_name]
+                if target_version in available_versions:
+                    logging.info(f"✅ Requested version '{target_version}' for app '{app_name}' is valid")
                 else:
-                    logging.info(f"Skipping update for '{app_name}'.")
+                    logging.error(f"❌ Requested version '{target_version}' for app '{app_name}' NOT FOUND on Docker Hub")
+                    logging.info(f"📋 Available versions for '{app_name}': {', '.join(available_versions[:10])}{'...' if len(available_versions) > 10 else ''}")
+                    all_valid = False
             else:
-                logging.info(f"'{app_name}' is up-to-date (version {current_version}).")
+                logging.error(f"❌ App '{app_name}' not found in Docker Hub repositories")
+                all_valid = False
 
+        if all_valid:
+            logging.info("✅ All requested app versions are valid!")
+        else:
+            logging.warning("⚠️  Some requested versions are invalid. Please check your APPS_TO_UPDATE configuration.")
+        
         flush_logs()
+
+
 
     def run(self):
         """
         Starts the version listener in a separate thread and keeps the application running.
-        Also starts another thread to periodically check Docker Hub for newer versions.
+        The updater will now enforce target versions specified by the user.
         """
+        logging.info("🚀 Starting Docker Application Updater...")
+        if self.version_listener.apps_to_update:
+            logging.info(f"📋 Apps to update: {self.version_listener.apps_to_update}")
+            logging.info(f"🎯 Will update the following apps when they report their versions:")
+            for app, version in self.version_listener.apps_to_update.items():
+                logging.info(f"   • {app} → {version}")
+        else:
+            logging.info("📋 No specific apps to update - will only monitor and log versions")
+        
         # Start the listener thread
         listener_thread = threading.Thread(target=self.version_listener.listen, daemon=True)
         listener_thread.start()
-
-        def hourly_check():
-            """
-            Runs in a loop, checking for new versions every hour.
-            """
-            while not self._stop_event.is_set():
-                # Perform the check
-                self.check_for_new_versions()
-                # Sleep for 2 minutes (120 seconds)
-                for _ in range(120):
-                    if self._stop_event.is_set():
-                        break
-                    time.sleep(1)
-
-        checker_thread = threading.Thread(target=hourly_check, daemon=True)
-        checker_thread.start()
+        logging.info("👂 Version listener started - waiting for application version reports...")
 
         flush_logs()
 
@@ -475,9 +484,8 @@ class MainApplication:
         finally:
             # Ensure the listener is stopped and the thread is joined before exiting
             self.version_listener.stop()
-            self._stop_event.set()  # Signal the checker thread to stop
+            self._stop_event.set()
             listener_thread.join()
-            checker_thread.join()
 
 if __name__ == "__main__":
     # Entry point of the application

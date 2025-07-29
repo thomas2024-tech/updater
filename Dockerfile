@@ -17,3 +17,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the application code
 COPY . ./
+
+# Command to run the updater
+CMD ["python", "-u", "updater.py"]
